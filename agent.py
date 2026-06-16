@@ -19,6 +19,63 @@ Usage (once implemented):
 """
 
 from tools import search_listings, suggest_outfit, create_fit_card
+from utils.style_profiles import load_profile, enhance_search_with_profile
+import re
+
+
+# ── helper: retry logic ──────────────────────────────────────────────────────
+
+def _search_with_retry(description: str, size: str | None, max_price: float | None) -> tuple[list, dict]:
+    """
+    Attempt search with automatic fallback/retry strategy.
+    
+    Returns: (results, retry_info) where:
+    - results: list of matching items (empty if all attempts fail)
+    - retry_info: dict with 'attempts', 'final_filters', 'message'
+    
+    Strategy:
+    1. Attempt 1: Search with all filters (description, size, max_price)
+    2. Attempt 2: If empty, retry without size
+    3. Attempt 3: If still empty, retry without size and +25% price
+    4. If all fail: Return empty list with error message
+    """
+    retry_info = {"attempts": [], "final_filters": None, "message": None}
+    
+    # Attempt 1: Initial search with all filters
+    retry_info["attempts"].append({"filters": f"description='{description}', size={size}, max_price={max_price}"})
+    results = search_listings(description, size=size, max_price=max_price)
+    if results:
+        retry_info["final_filters"] = {"description": description, "size": size, "max_price": max_price}
+        retry_info["message"] = None
+        return results, retry_info
+    
+    # Attempt 2: Remove size constraint
+    if size:
+        retry_info["attempts"].append({"filters": f"description='{description}', size=None, max_price={max_price}"})
+        results = search_listings(description, size=None, max_price=max_price)
+        if results:
+            retry_info["final_filters"] = {"description": description, "size": None, "max_price": max_price}
+            retry_info["message"] = f"Relaxed search: removed size filter '{size}' to find results."
+            return results, retry_info
+    
+    # Attempt 3: Remove size AND increase price by 25%
+    if max_price:
+        increased_price = max_price * 1.25
+        retry_info["attempts"].append({"filters": f"description='{description}', size=None, max_price={increased_price}"})
+        results = search_listings(description, size=None, max_price=increased_price)
+        if results:
+            retry_info["final_filters"] = {"description": description, "size": None, "max_price": increased_price}
+            price_increase = increased_price - max_price
+            retry_info["message"] = f"Relaxed search: removed size filter '{size}' and increased max price from ${max_price:.0f} to ${increased_price:.0f}."
+            return results, retry_info
+    
+    # All attempts failed
+    retry_info["message"] = (
+        f"No results found after trying: (1) your original filters (size: {size}, max price: ${max_price}), "
+        f"(2) without size, (3) without size and 25% higher price. "
+        f"Try: (1) broadening your keywords, (2) searching for a different style, (3) increasing your budget significantly."
+    )
+    return [], retry_info
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -42,12 +99,14 @@ def _new_session(query: str, wardrobe: dict) -> dict:
         "outfit_suggestion": None,   # string returned by suggest_outfit
         "fit_card": None,            # string returned by create_fit_card
         "error": None,               # set if the interaction ended early
+        "retry_info": None,          # retry attempt details (if search needed retries)
+        "profile": None,             # loaded style profile (if user_id provided)
     }
 
 
 # ── planning loop ─────────────────────────────────────────────────────────────
 
-def run_agent(query: str, wardrobe: dict) -> dict:
+def run_agent(query: str, wardrobe: dict, user_id: str | None = None) -> dict:
     """
     Main agent entry point. Runs the FitFindr planning loop for a single
     user interaction and returns the completed session dict.
@@ -92,9 +151,85 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # Step 1b: Load style profile if user_id provided
+    profile = None
+    if user_id:
+        profile = load_profile(user_id)
+        session["profile"] = profile
+
+    # Step 2: Parse query for price and size
+    q = query or ""
+    # max price: look for 'under $30' or 'under 30' or '$30'
+    price_match = re.search(r"under\s*\$?(\d+(?:\.\d+)?)", q, flags=re.IGNORECASE)
+    if not price_match:
+        price_match = re.search(r"\$\s*(\d+(?:\.\d+)?)", q)
+    max_price = float(price_match.group(1)) if price_match else None
+
+    # size: look for 'size M' or 'size: M' or just ' size M'
+    size_match = re.search(r"size\s*[:]?\s*([A-Za-z0-9/]+)", q, flags=re.IGNORECASE)
+    size = size_match.group(1) if size_match else None
+
+    # description: remove explicit phrases
+    desc = q
+    if price_match:
+        desc = re.sub(price_match.group(0), "", desc, flags=re.IGNORECASE)
+    if size_match:
+        desc = re.sub(size_match.group(0), "", desc, flags=re.IGNORECASE)
+    desc = desc.strip()
+    if not desc:
+        desc = q
+
+    # Apply style profile defaults (only fills in values the query didn't provide)
+    if profile:
+        if not size and profile.get("preferred_sizes"):
+            size = profile["preferred_sizes"][0]
+        if max_price is None and profile.get("budget_range", {}).get("max"):
+            max_price = float(profile["budget_range"]["max"])
+        desc = enhance_search_with_profile(desc, profile)
+
+    session["parsed"] = {"description": desc, "size": size, "max_price": max_price}
+
+    # Step 3: Call search_listings with retry logic
+    try:
+        results, retry_info = _search_with_retry(desc, size, max_price)
+        session["retry_info"] = retry_info
+    except Exception as e:
+        session["error"] = "Temporary data error — please try again later."
+        session["error_details"] = str(e)
+        return session
+
+    session["search_results"] = results
+    if not results:
+        print("State: EvaluateSearch — no results found")
+        session["error"] = retry_info["message"]
+        return session
+
+    # Step 4: select top result
+    top = results[0]
+    session["selected_item"] = top
+
+    # Step 5: suggest outfit
+    try:
+        outfit_text = suggest_outfit(top, wardrobe)
+    except Exception as e:
+        session["error"] = "Failed to create outfit suggestion."
+        session["error_details"] = str(e)
+        return session
+
+    session["outfit_suggestion"] = outfit_text
+
+    # Step 6: create fit card
+    try:
+        fit_card = create_fit_card(outfit_text, top)
+    except Exception as e:
+        session["error"] = "Failed to create fit card."
+        session["error_details"] = str(e)
+        return session
+
+    session["fit_card"] = fit_card
+    session["error"] = None
     return session
 
 
